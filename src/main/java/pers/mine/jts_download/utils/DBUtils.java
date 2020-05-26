@@ -2,16 +2,22 @@ package pers.mine.jts_download.utils;
 
 import com.alibaba.druid.pool.DruidDataSource;
 import com.alibaba.druid.pool.DruidDataSourceFactory;
+import com.alibaba.druid.pool.DruidPooledPreparedStatement;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
+import com.mysql.jdbc.JDBC4Connection;
+import com.mysql.jdbc.StatementImpl;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.sql.DataSource;
+import java.lang.reflect.Method;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 
 /**
@@ -105,6 +111,71 @@ public final class DBUtils {
             return null;
         }
         return s.replaceAll("'", "''").replaceAll("\\\\", "\\\\\\\\");
+    }
+
+    /**
+     * java.sql.PreparedStatement -> com.mysql.jdbc.StatementImpl
+     */
+    public static StatementImpl cast2StatementImpl(PreparedStatement pstmt) {
+        StatementImpl statementImpl = null;
+        if (pstmt instanceof StatementImpl) {
+            statementImpl = ((StatementImpl) pstmt);
+        } else if (pstmt instanceof DruidPooledPreparedStatement) {
+            PreparedStatement rawPreparedStatement = ((DruidPooledPreparedStatement) pstmt).getRawPreparedStatement();
+            if (rawPreparedStatement instanceof StatementImpl) {
+                statementImpl = ((StatementImpl) rawPreparedStatement);
+            } else {
+                LOG.warn("不支持的Druid rawPreparedStatement - {}", rawPreparedStatement.getClass().getName());
+            }
+        }
+        if (statementImpl == null) {
+            throw new UnsupportedOperationException(String.format("不支持转换的PreparedStatement类型 - %s ", pstmt.getClass().getName()));
+        }
+        return statementImpl;
+    }
+
+    public static List<Object> getPreparedStatementBatchedArgs(PreparedStatement pstmt) throws Exception {
+        StatementImpl statementImpl = cast2StatementImpl(pstmt);
+
+        final List<Object> batchedArgs = statementImpl.getBatchedArgs();
+        List<Object> list = new ArrayList<Object>(batchedArgs.size());
+        list.addAll(batchedArgs);
+        return list;
+    }
+
+    public static String getInsertSql(PreparedStatement pstmt) throws Exception {
+        return getInsertSql(pstmt, null);
+    }
+
+    @SuppressWarnings("PMD.AvoidReassigningParameters")
+    public static String getInsertSql(PreparedStatement pstmt, List<Object> batchedArgs) throws Exception {
+        StatementImpl statementImpl = cast2StatementImpl(pstmt);
+        boolean isRewriteBatchedStatementsSupported = ((JDBC4Connection) statementImpl.getConnection()).getURL().contains("rewriteBatchedStatements=true");
+        if (!isRewriteBatchedStatementsSupported) {
+            LOG.warn("rewriteBatchedStatements not supported add rewriteBatchedStatements=true to your connection string");
+        }
+        if (null == batchedArgs) {
+            batchedArgs = statementImpl.getBatchedArgs();
+        }
+
+        Method getParseInfo = com.mysql.jdbc.PreparedStatement.class.getDeclaredMethod("getParseInfo");
+        getParseInfo.setAccessible(true);
+        Object parseInfo = getParseInfo.invoke(statementImpl);
+
+        Method getSqlForBatch = parseInfo.getClass().getDeclaredMethod("getSqlForBatch", int.class);
+        getSqlForBatch.setAccessible(true);
+        String batchSql = (String) getSqlForBatch.invoke(parseInfo, batchedArgs.size());
+
+        PreparedStatement batchedStatement = statementImpl.getConnection().prepareStatement(batchSql);
+        Method setOneBatchedParameterSet = com.mysql.jdbc.PreparedStatement.class.getDeclaredMethod("setOneBatchedParameterSet", PreparedStatement.class, int.class, Object.class);
+        setOneBatchedParameterSet.setAccessible(true);
+        int batchedParamIndex = 1;
+        for (int paramCount = 0; paramCount < batchedArgs.size(); paramCount++) {
+            batchedParamIndex = (int) setOneBatchedParameterSet.invoke(batchedStatement, batchedStatement, batchedParamIndex, batchedArgs.get(paramCount));
+        }
+        String lastSql = ((com.mysql.jdbc.PreparedStatement) batchedStatement).asSql();
+        batchedStatement.close();
+        return lastSql;
     }
 
     public static JSONArray selectFileList(int offset, int limit, String typeLimit) {
@@ -205,7 +276,7 @@ public final class DBUtils {
         }
     }
 
-    public static void updateFileName(int id, String name,String loaclPath) throws Exception {
+    public static void updateFileName(int id, String name, String loaclPath) throws Exception {
         String sql = "UPDATE `jts_file` SET name=?,local_path=?,update_time=now() WHERE id=?";
         Connection conn = null;
         PreparedStatement ps = null;
